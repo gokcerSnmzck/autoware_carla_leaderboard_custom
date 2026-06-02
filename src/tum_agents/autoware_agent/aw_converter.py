@@ -21,22 +21,37 @@ from autoware_perception_msgs.msg import PredictedObjects, PredictedObject, Obje
 
 
 class AutowareToCarlaControl:
-    def __init__(self):
+    def __init__(self, vehicle_model='vehicle.audi.etron'):
+        self._vehicle_model = vehicle_model
         # Lateral Conversion Map
-        self._ackermann_angle = np.array([0, 6.7780, 13.1744,
-                                          19.2750, 25.1526,
-                                          30.8688, 36.4756,
-                                          42.0187, 47.5399,
-                                          53.0797, 58.6798])
+        if 'fr-max' in vehicle_model:
+            # 25 degrees (0.436 rad) limit robot
+            self._ackermann_angle = np.array([0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0, 22.5, 25.0])
+        else:
+            self._ackermann_angle = np.array([0, 6.7780, 13.1744,
+                                            19.2750, 25.1526,
+                                            30.8688, 36.4756,
+                                            42.0187, 47.5399,
+                                            53.0797, 58.6798])
+        
         self._carla_angle = np.array([0.0, -0.1, -0.2, -0.3, -0.4, -0.5,
                                        -0.6, -0.7, -0.8, -0.9, -1.0])
         
         # Longitudinal P-Control
-        self._Kp = 0.5
-        self._Ki = 0.1
-        self._Kd = 0.0
-        self._max_throttle = 0.6
-        self._max_brake = 0.2
+        if 'fr-max' in vehicle_model:
+            # Tuned for 156kg robot with 1800W motor
+            self._Kp = 0.25 # Lower Kp to prevent oscillation for light vehicle
+            self._Ki = 0.05
+            self._Kd = 0.0
+            self._max_throttle = 0.4 # Cap power for the small robot
+            self._max_brake = 0.3
+        else:
+            self._Kp = 0.5
+            self._Ki = 0.1
+            self._Kd = 0.0
+            self._max_throttle = 0.6
+            self._max_brake = 0.2
+            
         self._dt = 0.05
         self._integral_error = 0.0
         self._prev_error = 0.0
@@ -351,11 +366,12 @@ class CarlaObjectsToAutoware:
 
 
 class AutowareConverter:
-    def __init__(self, ego_vehicle: carla.Vehicle, world: carla.World):
+    def __init__(self, ego_vehicle: carla.Vehicle, world: carla.World, vehicle_model='vehicle.audi.etron'):
         self._ego_vehicle = ego_vehicle
         self._world = world
+        self._vehicle_model = vehicle_model
         self._vector_carlavehicle_to_autowarebase = np.array([0.0, 0.0, 0.0])
-        self._control_converter = AutowareToCarlaControl()
+        self._control_converter = AutowareToCarlaControl(vehicle_model=vehicle_model)
         self._carla_objects_converter = CarlaObjectsToAutoware(self._ego_vehicle, self._world)
 
         # ACC butter filter + low pass filter
@@ -548,14 +564,14 @@ class AutowareConverter:
 
         return control_timestamp, control
     
-    def convert_lidar_data(self, lidar_numpy):
-
+    def convert_lidar_data(self, lidar_numpy, num_channels=64):
+        # CARLA uses (x, y, z, intensity) where y is left-handed.
+        # Autoware/ROS2 uses (x, y, z, intensity, return_type, channel) where y is right-handed.
         lidar_numpy[:, 1] *= -1
 
+        # Intensity in CARLA is 0.0-1.0, map to 0-255 uint8
         lidar_numpy[:, 3] *= 255
         np.clip(lidar_numpy[:, 3], 0, 255, out=lidar_numpy[:, 3])
-
-        num_channels = 64  # Set this to match your CARLA config
 
         # Trim lidar_numpy to the nearest full channel set
         total_points = lidar_numpy.shape[0]
@@ -565,10 +581,11 @@ class AutowareConverter:
         lidar_numpy = lidar_numpy[:valid_point_count]
 
         # Simulate channel ID (C) and return type (R)
-        channel_ids = np.tile(np.arange(num_channels), points_per_channel)
+        channel_ids = np.tile(np.arange(num_channels, dtype=np.uint16), points_per_channel)
         return_types = np.zeros(valid_point_count, dtype=np.uint8)  # All single return
 
-        #  x(float32), y(float32), z(float32), intensity(uint8), padding(3 bytes)
+        #  x(float32), y(float32), z(float32), intensity(uint8), return_type(uint8), channel(uint16)
+        # Total: 4+4+4+1+1+2 = 16 bytes
         dtype = np.dtype([
             ('x', np.float32),
             ('y', np.float32),
@@ -601,11 +618,12 @@ class AutowareConverter:
         msg.width = structured_points.shape[0]
         msg.fields = fields
         msg.is_bigendian = False
-        msg.point_step = 16  # 16 bytes per point (float32*3 + uint8 + 3 padding)
+        msg.point_step = 16  # 16 bytes per point
         msg.row_step = msg.point_step * structured_points.shape[0]
         msg.is_dense = True
         msg.data = structured_points.tobytes()  
         return msg  
+
     
     def getAcc(self, loc_msg):
         self._last_acc = loc_msg.accel.accel.linear.x

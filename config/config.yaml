@@ -1,7 +1,7 @@
 evaluation:
   agent_setup:
     # Path to Agent's .py file to evaluate
-    agent: src/autoware_agent/aw_e2e.py
+    agent: src/tum_agents/autoware_agent/aw_e2e.py
     # This is for the priviliged
     #agent: src/autoware_agent/aw_priviliged.py
     # Path to Agent's configuration file (default: "")
@@ -33,8 +33,12 @@ evaluation:
     # Run with visualization (default: 0)
     tmp_visu: 0
   simulation_setup:
+    # Ego vehicle model (e.g., vehicle.audi.etron, fr-maxv10)
+    ego_vehicle_model: fr-maxv10
     # Name of the routes file to be executed
-    routes: resources/routes/town01_parking_pedestrian_crossing_short.xml
+    # routes: resources/routes/town01_parking_pedestrian_crossing_short.xml
+    routes: resources/routes/town01_cyclist_follower_v2.xml
+    #town01_cyclist_follower_v2.xml
     # Execute a specific set of routes (default: "")
     routes-subset: ""
     # Number of repetitions per route (default: 1)

@@ -77,6 +77,31 @@ class AutowareE2EAgent(TUMROSBaseAgent):
 
     def __init__(self, carla_host, carla_port, debug=False):
         super(AutowareE2EAgent, self).__init__(self.ROS_VERSION, carla_host, carla_port, debug)
+        
+        # Initialize all attributes before creating ROS2 resources to avoid race conditions in callbacks
+        self._aw_time = None
+        self._vehicle_model = None
+        self._publish_cam_image = False
+        self._traffic_light_ids = set()
+        self._use_v2x_traffic_light = True
+        self._is_autonomous = False
+        self._steps_before_init = 0
+        self._counter = 0
+        self._published_latest = False
+        self._goal_mod_failure_counter = 0
+        self._pending_service_call = False
+        self._route_extended = False
+        self._time_to_wait_for_control = 5.0
+        self._last_control_timestamp = None
+        self._control_queue = queue.Queue(maxsize=1)
+        self._camera_height = None
+        self._camera_width = None
+        self._camera_fov = None
+        self._client = None
+        self._vehicle = None
+        self._world = None
+        self._map = None
+
         rclpy.init(args=None)
         self.ros_node = rclpy.create_node("autoware_e2e_node")
 
@@ -126,23 +151,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._external_traffic_light_publisher = self.ros_node.create_publisher(TrafficLightGroupArray, "/perception/traffic_light_recognition/traffic_signals", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
 
         # Sync stuff
-        self._aw_time = None
         self.ready_status = DiagnosticStatus()
         self.ready_status.level = DiagnosticStatus.OK
         self.ready_status.name = "AutowareE2EAgent"
 
         # --End of Autoware Stuff--
-        self._client = None
-        self._vehicle = None
-        self._world = None
-        self._map = None
-
-        self._camera_height = None
-        self._camera_width = None
-        self._camera_fov = None
 
         self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.ros_node,))
         self.spin_thread.start()
+
 
     def setup(self, path_to_conf_file):
         self.track = Track.MAP
@@ -150,9 +167,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # Autoware Priviliged Stuff
         self._client = CarlaDataProvider.get_client()
         self._vehicle = CarlaDataProvider.get_hero_actor()
+        self._vehicle_model = self._vehicle.type_id
         self._world = self._vehicle.get_world()
         self._map = self._world.get_map()
-        self._awp_converter = AutowareConverter(self._vehicle, self._world)
+        self._awp_converter = AutowareConverter(self._vehicle, self._world, vehicle_model=self._vehicle_model)
+        self._sensor_configs = self.sensors()
         self._last_control = carla.VehicleControl(throttle=0.0)
         self._route_index = 1 # Start with 1, because 0 is the start point
         self._last_published_route_index = None
@@ -174,23 +193,49 @@ class AutowareE2EAgent(TUMROSBaseAgent):
 
         self._time_to_wait_for_control = 99.0
     
-    def sensors(self) -> list:
-        sensors = [
-        {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_front',
-         'x': 0.3, 'y': 0.0, 'z': 1.70, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-         'channels': 128, 'rotation_frequency': 20, 'points_per_second': 1800000,
-         'ros_name': 'sensor/lidar/front'},
-        {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_rear',
-         'x': -1.45, 'y': 0.0, 'z': 1.70, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-         'channels': 64, 'rotation_frequency': 20, 'points_per_second': 700000,
-         'ros_name': 'sensor/lidar/back'},
-        {'type': 'sensor.other.gnss', 'id': 'GPS',
-         'x': 0.0, 'y': 0.0, 'z': 0.0}
-        ]
+    def sensors(self):
+        if self._vehicle_model is None:
+            # Fallback for initialization before spawning
+             hero = CarlaDataProvider.get_hero_actor()
+             if hero:
+                 self._vehicle_model = hero.type_id
+
+        if self._vehicle_model and 'fr-max' in self._vehicle_model:
+            # FR-Max specific sensor kit calibration
+            sensors = [
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_front',
+             'x': 0.75, 'y': 0.0, 'z': 0.55, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 32, 'rotation_frequency': 20, 'points_per_second': 600000,
+             'ros_name': 'sensor/lidar/front'},
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_rear',
+             'x': -0.75, 'y': 0.0, 'z': 0.55, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 16, 'rotation_frequency': 20, 'points_per_second': 300000,
+             'ros_name': 'sensor/lidar/back'},
+            {'type': 'sensor.other.gnss', 'id': 'GPS',
+             'x': 0.0, 'y': 0.0, 'z': 0.52},
+            {'type': 'sensor.other.imu', 'id': 'IMU',
+             'x': 0.1, 'y': 0.0, 'z': 0.3, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0}
+            ]
+        else:
+            # Audi E-Tron default sensor kit
+            sensors = [
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_front',
+             'x': 0.3, 'y': 0.0, 'z': 1.70, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 128, 'rotation_frequency': 20, 'points_per_second': 1800000,
+             'ros_name': 'sensor/lidar/front'},
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_rear',
+             'x': -1.45, 'y': 0.0, 'z': 1.70, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 64, 'rotation_frequency': 20, 'points_per_second': 700000,
+             'ros_name': 'sensor/lidar/back'},
+            {'type': 'sensor.other.gnss', 'id': 'GPS',
+             'x': 0.0, 'y': 0.0, 'z': 0.0}
+            ]
 
         if self._publish_cam_image:
+            camera_z = 0.52 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 2.0
             sensors.append({ "type": "sensor.camera.rgb", "id": "CAMERA_front",
-            "x": 0.0, "y": 0.0, "z": 2.0, 
+            "x": 0.7 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 0.0, 
+            "y": 0.0, "z": camera_z, 
             "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "width": 800 , "height": 400,
             "fov": 90.0,
             'ros_name': 'sensor/camera'})
@@ -267,6 +312,34 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         )
         imu_msg.linear_acceleration = Vector3(**loc_acc["position"])
         self._imu_pub.publish(imu_msg)
+
+        # # -- Sensors --
+        # for sensor_cfg in self._sensor_configs:
+        #     sensor_id = sensor_cfg['id']
+        #     if sensor_id in input_data:
+        #         if 'LIDAR' in sensor_id:
+        #             lidar_data = input_data[sensor_id][1]
+        #             num_channels = sensor_cfg.get('channels', 64)
+        #             lidar_msg = self._awp_converter.convert_lidar_data(lidar_data, num_channels)
+        #             lidar_msg.header.stamp = aw_time
+        #             lidar_msg.header.frame_id = "lidar_front" if "front" in sensor_id.lower() else "lidar_rear"
+                    
+        #             if "front" in sensor_id.lower():
+        #                 self._lidar_pub_front.publish(lidar_msg)
+        #             else:
+        #                 self._lidar_pub_rear.publish(lidar_msg)
+                
+        #         elif 'CAMERA' in sensor_id and self._publish_cam_image:
+        #             cam_msg = Image()
+        #             cam_msg.header.stamp = aw_time
+        #             cam_msg.header.frame_id = "camera_front_optical_link"
+        #             cam_msg.height = self._camera_height
+        #             cam_msg.width = self._camera_width
+        #             cam_msg.encoding = "bgra8"
+        #             cam_msg.is_bigendian = 0
+        #             cam_msg.step = self._camera_width * 4
+        #             cam_msg.data = memoryview(input_data[sensor_id][1]).tobytes()
+        #             self._camera_pub.publish(cam_msg)
         
         if self._use_v2x_traffic_light:
             # We set all autoware traffic lights to the state of the currently affecting traffic light

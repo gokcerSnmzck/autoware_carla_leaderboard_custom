@@ -78,6 +78,22 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
     def __init__(self, carla_host, carla_port, debug=False):
         super(AutowarePriviligedAgent, self).__init__(self.ROS_VERSION, carla_host, carla_port, debug)
+
+        # Initialize attributes
+        self._vehicle_model = None
+        self._publish_cam_image = False
+        self._traffic_light_ids = set()
+        self._is_autonomous = False
+        self._published_latest = False
+        self._goal_mod_failure_counter = 0
+        self._camera_height = None
+        self._camera_width = None
+        self._camera_fov = None
+        self._client = None
+        self._vehicle = None
+        self._world = None
+        self._map = None
+
         rclpy.init(args=None)
         self.ros_node = rclpy.create_node("autoware_priviliged_node")
 
@@ -122,10 +138,6 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
 
         # --End of Autoware Stuff--
-        self._client = None
-        self._vehicle = None
-        self._world = None
-        self._map = None
         # TODO(GEMB): Integrate later again, this stops the node until autowre is ready and launched
         # wait_for_message(self.ros_node, "/carla/hero/status", Bool)
 
@@ -138,30 +150,51 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         # Autoware Priviliged Stuff
         self._client = CarlaDataProvider.get_client()
         self._vehicle = CarlaDataProvider.get_hero_actor()
+        self._vehicle_model = self._vehicle.type_id
         self._world = self._vehicle.get_world()
         self._map = self._world.get_map()
-        self._awp_converter = AutowareConverter(self._vehicle, self._world)
+        self._awp_converter = AutowareConverter(self._vehicle, self._world, vehicle_model=self._vehicle_model)
+        self._sensor_configs = self.sensors()
         self._last_control = carla.VehicleControl(throttle=0.0)
         self._route_index = 1 # Start with 1, because 0 is the start point
         self._last_published_route_index = None
         self._published_latest = False
         self._goal_mod_failure_counter = 0
         self._is_autonomous = False
-
-        self._traffic_light_ids = set()  
         self._publish_cam_image = False # For Debugging
+        self._traffic_light_ids = set()
+
+        self._camera_height = None
+        self._camera_width = None
+        self._camera_fov = None
     
     def sensors(self) -> list:
-        # The privileged expert using Autoware doesn't need any sensors
-        sensors = []
+        # The privileged expert using Autoware uses ground truth but still needs
+        # sensors for some modules like AEB
+        sensors = [
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_front',
+             'x': 0.75 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 0.3,
+             'y': 0.0, 'z': 0.55 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 1.70,
+             'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 32 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 128,
+             'rotation_frequency': 20, 'points_per_second': 600000},
+            {'type': 'sensor.lidar.ray_cast', 'id': 'LIDAR_rear',
+             'x': -0.75 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else -1.45,
+             'y': 0.0, 'z': 0.55 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 1.70,
+             'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'channels': 16 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 64,
+             'rotation_frequency': 20, 'points_per_second': 300000}
+        ]
         if self._publish_cam_image:
+            camera_z = 0.52 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 2.0
             sensors.append({ "type": "sensor.camera.rgb", "id": "CAMERA_front",
-                "x": 0.0, "y": 0.0, "z": 2.0, 
-                "roll": 0.0, "pitch": 00.0, "yaw": 0.0, "width": 600 , "height": 300,
+                "x": 0.7 if (self._vehicle_model and 'fr-max' in self._vehicle_model) else 0.0, 
+                "y": 0.0, "z": camera_z, 
+                "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "width": 600 , "height": 300,
                 "fov": 90.0})
-            self._camera_height = next(s for s in sensors if s["type"] == "sensor.camera.rgb")["height"]
-            self._camera_width = next(s for s in sensors if s["type"] == "sensor.camera.rgb")["width"]
-            self._camera_fov = next(s for s in sensors if s["type"] == "sensor.camera.rgb")["fov"]
+            self._camera_height = next(s for s in sensors if s["id"] == "CAMERA_front")["height"]
+            self._camera_width = next(s for s in sensors if s["id"] == "CAMERA_front")["width"]
+            self._camera_fov = next(s for s in sensors if s["id"] == "CAMERA_front")["fov"]
 
         return sensors
 
@@ -265,19 +298,34 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._imu_pub.publish(imu_msg)
         
         # -- Sensors --
-
-        if self._publish_cam_image:
-            cam_msg = Image()
-            cam_msg.header.stamp.sec = time_sec
-            cam_msg.header.stamp.nanosec = time_nsec
-            cam_msg.header.frame_id = "camera_front_optical_link"
-            cam_msg.height = self._camera_height  # Must be set, e.g., 600
-            cam_msg.width = self._camera_width 
-            cam_msg.encoding = "bgra8"
-            cam_msg.is_bigendian = 0
-            cam_msg.step = self._camera_width * 4 
-            cam_msg.data = memoryview(input_data['CAMERA_front'][1]).tobytes()
-            self._camera_pub.publish(cam_msg)
+        for sensor_cfg in self._sensor_configs:
+            sensor_id = sensor_cfg['id']
+            if sensor_id in input_data:
+                if 'LIDAR' in sensor_id:
+                    lidar_data = input_data[sensor_id][1]
+                    num_channels = sensor_cfg.get('channels', 64)
+                    lidar_msg = self._awp_converter.convert_lidar_data(lidar_data, num_channels)
+                    lidar_msg.header.stamp.sec = time_sec
+                    lidar_msg.header.stamp.nanosec = time_nsec
+                    lidar_msg.header.frame_id = "lidar_front" if "front" in sensor_id.lower() else "lidar_rear"
+                    
+                    if "front" in sensor_id.lower():
+                        self._lidar_pub.publish(lidar_msg)
+                    # Note: Privileged agent currently only has one lidar publisher in __init__
+                    # I should probably add _lidar_pub_rear if needed, but for now matching the existing _lidar_pub
+                
+                elif 'CAMERA' in sensor_id and self._publish_cam_image:
+                    cam_msg = Image()
+                    cam_msg.header.stamp.sec = time_sec
+                    cam_msg.header.stamp.nanosec = time_nsec
+                    cam_msg.header.frame_id = "camera_front_optical_link"
+                    cam_msg.height = self._camera_height
+                    cam_msg.width = self._camera_width 
+                    cam_msg.encoding = "bgra8"
+                    cam_msg.is_bigendian = 0
+                    cam_msg.step = self._camera_width * 4 
+                    cam_msg.data = memoryview(input_data[sensor_id][1]).tobytes()
+                    self._camera_pub.publish(cam_msg)
 
         # GT Objects
         objects_msg = self._awp_converter.create_predicted_object_message()
